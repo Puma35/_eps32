@@ -225,6 +225,23 @@ uint16_t compute_rms(const int16_t *samples, size_t n) {
     return (uint16_t)sqrtf((float)sum / n);
 }
 
+// Soustrait le DC et applique le gain IN PLACE -- a appeler juste avant ecriture WAV
+// Le signal resultant est centre sur 0 et amplifie : ideal pour WAV propre
+void prepare_wav_chunk(int16_t *samples, size_t n) {
+    if (n == 0) return;
+    // Calcul DC
+    int64_t mean_sum = 0;
+    for (size_t i = 0; i < n; i++) mean_sum += samples[i];
+    int32_t dc = (int32_t)(mean_sum / (int64_t)n);
+    // Soustraction DC + gain
+    for (size_t i = 0; i < n; i++) {
+        int32_t s = ((int32_t)samples[i] - dc) * MIC_GAIN;
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
+        samples[i] = (int16_t)s;
+    }
+}
+
 // ============================================================
 //  ZCR -- Zero Crossing Rate (crossings par chunk)
 // ============================================================
@@ -467,15 +484,8 @@ void record_vad() {
             vote_count = chunk_voice ? (vote_count + 1) : 0;
         bool voice = recording ? chunk_voice : (vote_count >= VAD_VOTE_NEEDED);
 
-        // Gain WAV
-        if (MIC_GAIN != 1) {
-            for (size_t i = 0; i < n_samp; i++) {
-                int32_t s = (int32_t)samples[i] * MIC_GAIN;
-                if (s >  32767) s =  32767;
-                if (s < -32768) s = -32768;
-                samples[i] = (int16_t)s;
-            }
-        }
+        // Gain WAV : soustraction DC + amplification (signal propre centre sur 0)
+        prepare_wav_chunk(samples, n_samp);
 
         // Stocker le chunk gaine dans le buffer pre-roll (ecrase le plus vieux si plein)
         if (!recording) {
