@@ -39,10 +39,10 @@
 #include <time.h>
 #include "driver/i2s.h"
 #include "esp_camera.h"
+#include "credentials.h"   // WIFI_SSID, WIFI_PASSWORD -- fichier gitignore
 
 // ---- WiFi + NTP ----
-#define WIFI_SSID        "DoubleBanana"
-#define WIFI_PASSWORD    "LveuLft#*35"
+// WIFI_SSID et WIFI_PASSWORD sont definis dans credentials.h (voir credentials.h.example)
 #define NTP_SERVER       "pool.ntp.org"
 #define NTP_TIMEOUT_MS   8000
 // Timezone France : CET-1 hiver, CEST-2 ete (DST auto)
@@ -97,9 +97,9 @@
 #define VAD_CHUNK_SAMPLES    (SAMPLE_RATE * VAD_CHUNK_MS / 1000)
 #define VAD_CHUNK_BYTES      (VAD_CHUNK_SAMPLES * 2)
 
-// Pre-roll : capture les N ms d'audio AVANT le declenchement (rattrapage premiers mots)
-#define PRE_ROLL_MS      1500
-#define PRE_ROLL_CHUNKS  (PRE_ROLL_MS / VAD_CHUNK_MS)  // 50 chunks x 30ms = 1500ms
+// Pre-roll : rattrape uniquement le delai de detection VAD (vote 90ms + overhead ~200ms)
+#define PRE_ROLL_MS      300
+#define PRE_ROLL_CHUNKS  (PRE_ROLL_MS / VAD_CHUNK_MS)  // 10 chunks x 30ms = 300ms
 
 // ---- Globals VAD ----
 float    noise_ema       = 1000.0f;
@@ -319,8 +319,8 @@ bool camera_init() {
     cfg.pin_reset    = RESET_GPIO_NUM;
     cfg.xclk_freq_hz = 20000000;
     cfg.pixel_format = PIXFORMAT_JPEG;
-    cfg.frame_size   = FRAMESIZE_XGA;
-    cfg.jpeg_quality = 12;
+    cfg.frame_size   = FRAMESIZE_UXGA;   // 1600x1200 (max OV2640)
+    cfg.jpeg_quality = 10;               // qualite legerement augmentee (0=max, 63=min)
     cfg.fb_count     = 1;
     cfg.fb_location  = CAMERA_FB_IN_PSRAM;
     cfg.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
@@ -330,7 +330,26 @@ bool camera_init() {
         Serial.printf("ERREUR camera: 0x%x\n", err);
         return false;
     }
-    Serial.println("Camera OK (OV2640 XGA 1024x768 JPEG)");
+    // Dispositif monte a l'envers : rotation 180 deg = vflip + hmirror
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_vflip(s, 1);
+        s->set_hmirror(s, 1);
+
+        // Anti-flou de bouge en interieur :
+        // Exposition manuelle courte + gain eleve pour compenser la luminosite
+        s->set_exposure_ctrl(s, 0);   // desactive AEC (auto-exposition)
+        s->set_aec_value(s, 150);     // exposition courte : 0=min 1200=max (defaut ~600)
+        s->set_gain_ctrl(s, 0);       // desactive AGC (auto-gain)
+        s->set_agc_gain(s, 20);       // gain manuel : 0-30 (0=x1, 30=x30)
+        s->set_aec2(s, 0);            // desactive AEC DSP supplementaire
+        s->set_ae_level(s, 0);        // niveau EV : -2 a +2
+        s->set_whitebal(s, 1);        // balance des blancs auto (garde)
+        s->set_awb_gain(s, 1);        // gain AWB auto (garde)
+        s->set_bpc(s, 1);             // correction pixels morts
+        s->set_wpc(s, 1);             // correction pixels blancs
+    }
+    Serial.println("Camera OK (OV2640 UXGA 1600x1200 JPEG, rotation 180deg, expo courte)");
     return true;
 }
 
@@ -364,8 +383,8 @@ bool mic_init() {
         .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT,
         .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count        = 8,
-        .dma_buf_len          = 64,
+        .dma_buf_count        = 16,
+        .dma_buf_len          = 256,
         .use_apll             = false,
         .tx_desc_auto_clear   = false,
         .fixed_mclk           = 0,
@@ -442,7 +461,8 @@ void record_vad() {
     uint16_t rms_peak     = 0;
     int      vote_count   = 0;
     bool     recording    = false;
-    char     session_id[24] = "";   // "YYYYMMDD_HHMMSS"
+    char     session_id[24]  = "";   // "YYYYMMDD_HHMMSS"
+    char     photo_path[64]  = "";   // chemin photo de la session en cours
 
     seed_noise_ema(buf, fbuf);
 
@@ -513,13 +533,13 @@ void record_vad() {
                 // Generer le nom de session horodate
                 get_timestamp(session_id, sizeof(session_id));
 
-                char dir[48], wav_path[64], photo_path[64];
+                char dir[48], wav_path[64];
                 snprintf(dir,        sizeof(dir),        "/session_%s",           session_id);
                 snprintf(wav_path,   sizeof(wav_path),   "/session_%s/audio.wav", session_id);
                 snprintf(photo_path, sizeof(photo_path), "/session_%s/photo.jpg", session_id);
 
                 SD.mkdir(dir);
-                take_photo(photo_path);
+                // Note : take_photo() appelée APRES la session pour ne pas bloquer l'I2S
 
                 wav = SD.open(wav_path, FILE_WRITE);
                 if (!wav) {
@@ -585,6 +605,10 @@ void record_vad() {
                 Serial.printf("[%s] Termine : %.1fs | %lu bytes | %s\n",
                               session_id, dur, written,
                               timeout ? "TIMEOUT MAX" : "SILENCE 5s");
+
+                // Photo prise APRES le WAV : pas de blocage pendant l'enregistrement
+                take_photo(photo_path);
+
                 Serial.println("[VAD] En attente de voix...\n");
                 recording = false;
             }

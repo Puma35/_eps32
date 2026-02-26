@@ -3,3 +3,15 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Credentials — ne jamais commiter
+src/credentials.h
+credentials.h
+secrets.h
+src/secrets.h
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
