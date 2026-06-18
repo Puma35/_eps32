@@ -113,9 +113,8 @@ Au démarrage, le firmware tente de se connecter au WiFi pour synchroniser l'heu
 - Après sync, le WiFi est **coupé** : la RTC interne ESP32-S3 continue seule
 - **Fallback sans WiFi** : noms de sessions de la forme `session_19700101_XXXXXX` (epoch identifiable)
 
-> **Sécurité** : les identifiants WiFi (SSID / mot de passe) sont définis directement dans `src/main.cpp`.  
-> ⚠️ **Ne jamais commiter ce fichier avec de vraies credentials dans un dépôt public.**  
-> Utiliser des variables d'environnement, un fichier `credentials.h` listé dans `.gitignore`, ou l'API NVS de l'ESP-IDF.
+> **Sécurité** : les identifiants WiFi (SSID / mot de passe) sont définis dans `src/credentials.h` (gitignorée).  
+> Copier `src/credentials.h.example` → `src/credentials.h` et renseigner les valeurs avant compilation.
 
 ---
 

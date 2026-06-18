@@ -438,6 +438,13 @@ void seed_noise_ema(uint8_t *buf, int16_t *fbuf) {
 }
 
 // ============================================================
+//  UTILITAIRES SD
+// ============================================================
+bool sd_has_space(uint64_t min_bytes = 200ULL * 1024 * 1024) {
+    return (SD.totalBytes() - SD.usedBytes()) >= min_bytes;
+}
+
+// ============================================================
 //  BOUCLE VAD + ENREGISTREMENT + SESSION HORODATEE
 // ============================================================
 void record_vad() {
@@ -453,12 +460,13 @@ void record_vad() {
     int preroll_count = 0;   // nb de chunks valides (0..PRE_ROLL_CHUNKS)
 
     File     wav;
-    uint32_t written      = 0;
-    uint32_t silence_ms   = 0;
-    uint32_t rec_start_ms = 0;
-    uint32_t last_print   = 0;
-    uint32_t last_veille  = 0;
-    uint16_t rms_peak     = 0;
+    uint32_t written         = 0;
+    uint32_t silence_ms      = 0;
+    uint32_t rec_start_ms    = 0;
+    uint32_t last_print      = 0;
+    uint32_t last_veille     = 0;
+    uint32_t last_header_ms  = 0;
+    uint16_t rms_peak        = 0;
     int      vote_count   = 0;
     bool     recording    = false;
     char     session_id[24]  = "";   // "YYYYMMDD_HHMMSS"
@@ -479,9 +487,9 @@ void record_vad() {
         int16_t *samples = (int16_t *)buf;
         size_t   n_samp  = bytes_read / 2;
 
-        // RMS brut AC (logs + EMA)
+        // RMS brut AC (logs veille uniquement)
         uint16_t rms_raw  = compute_rms(samples, n_samp);
-        if (rms_raw > rms_peak) rms_peak = rms_raw;
+        if (!recording && rms_raw > rms_peak) rms_peak = rms_raw;
 
         // Bandpass -> RMS filtre + ZCR (decision VAD)
         apply_bandpass(samples, fbuf, n_samp);
@@ -489,9 +497,10 @@ void record_vad() {
         uint16_t zcr      = compute_zcr(fbuf, n_samp);
         bool     zcr_ok   = (zcr >= ZCR_MIN && zcr <= ZCR_MAX);
 
-        // EMA en veille uniquement
+        // EMA en veille uniquement — plancher = 50% du bruit de fond initial
         if (!recording) {
             noise_ema   = EMA_ALPHA * noise_ema + (1.0f - EMA_ALPHA) * (float)rms_filt;
+            noise_ema   = max(noise_ema, noise_floor_abs * 0.5f);
             vad_trigger = max((uint16_t)VAD_MIN_TRIGGER, (uint16_t)(noise_ema * VAD_TRIGGER_FACTOR));
             vad_silence = max((uint16_t)VAD_MIN_SILENCE,  (uint16_t)(noise_ema * VAD_SILENCE_FACTOR));
         }
@@ -538,6 +547,11 @@ void record_vad() {
                 snprintf(wav_path,   sizeof(wav_path),   "/session_%s/audio.wav", session_id);
                 snprintf(photo_path, sizeof(photo_path), "/session_%s/photo.jpg", session_id);
 
+                if (!sd_has_space()) {
+                    Serial.println("[VAD] AVERTISSEMENT: espace SD faible (<200MB) -- session ignoree");
+                    vote_count = 0;
+                    continue;
+                }
                 SD.mkdir(dir);
                 // Note : take_photo() appelée APRES la session pour ne pas bloquer l'I2S
 
@@ -562,12 +576,13 @@ void record_vad() {
                     preroll_count = 0;
                     preroll_head  = 0;
                 }
-                silence_ms   = 0;
-                vote_count   = 0;
-                rms_peak     = 0;
-                rec_start_ms = now;
-                last_print   = now;
-                recording    = true;
+                silence_ms      = 0;
+                vote_count      = 0;
+                rms_peak        = 0;
+                rec_start_ms    = now;
+                last_print      = now;
+                last_header_ms  = now;
+                recording       = true;
                 Serial.printf("\n[%s] Demarre -> %s  (rms_filt=%u trigger=%u)\n",
                               session_id, wav_path, rms_filt, vad_trigger);
             }
@@ -597,6 +612,13 @@ void record_vad() {
                 last_print = now;
             }
 
+            // Header WAV mis a jour toutes les 10s : WAV lisible meme en cas de coupure
+            if (now - last_header_ms >= 10000) {
+                write_wav_header(wav, written);
+                wav.seek(sizeof(wav_header_t) + written);
+                last_header_ms = now;
+            }
+
             bool timeout = ((now - rec_start_ms) >= (uint32_t)MAX_RECORD_SEC * 1000);
             if (silence_ms >= SILENCE_TIMEOUT_MS || timeout) {
                 write_wav_header(wav, written);
@@ -614,10 +636,6 @@ void record_vad() {
             }
         }
     }
-
-    free(buf);
-    free(fbuf);
-    free(preroll);
 }
 
 // ============================================================
