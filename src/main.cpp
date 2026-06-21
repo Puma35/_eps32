@@ -88,6 +88,8 @@ struct AppConfig {
     bool     gps_enabled;
     uint8_t  gps_rx_pin;
     uint8_t  gps_tx_pin;
+    uint16_t idle_photo_interval_s;  // 0 = desactive
+    uint16_t rec_photo_interval_s;   // 0 = desactive
 };
 static AppConfig g_cfg;
 
@@ -489,6 +491,8 @@ const CAM_SLIDERS=[
   ['cam_quality','Qualite JPEG',0,63,1],
   ['cam_aec_value','Exposition AEC',0,1200,10],
   ['cam_agc_gain','Gain AGC',0,30,1],
+  ['idle_photo_interval_s','Photo veille s (0=off)',0,300,5],
+  ['rec_photo_interval_s','Photo enreg. s (0=off)',0,60,5],
 ];
 function buildSliders(id,arr){
   document.getElementById(id).innerHTML+=arr.map(([n,l,mn,mx,st])=>
@@ -747,9 +751,11 @@ static void handle_config_get(AsyncWebServerRequest *req) {
     doc["cam_framesize"]       = g_cfg.cam_framesize;
     doc["cam_aec_value"]       = g_cfg.cam_aec_value;
     doc["cam_agc_gain"]        = g_cfg.cam_agc_gain;
-    doc["gps_enabled"]         = g_cfg.gps_enabled;
-    doc["gps_rx_pin"]          = g_cfg.gps_rx_pin;
-    doc["gps_tx_pin"]          = g_cfg.gps_tx_pin;
+    doc["gps_enabled"]           = g_cfg.gps_enabled;
+    doc["gps_rx_pin"]            = g_cfg.gps_rx_pin;
+    doc["gps_tx_pin"]            = g_cfg.gps_tx_pin;
+    doc["idle_photo_interval_s"] = g_cfg.idle_photo_interval_s;
+    doc["rec_photo_interval_s"]  = g_cfg.rec_photo_interval_s;
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -763,9 +769,19 @@ static void handle_session_delete(AsyncWebServerRequest *req) {
     }
     String base = "/session_" + id;
     if (g_sd_mutex) xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-    SD.remove((base + "/audio.wav").c_str());
-    SD.remove((base + "/photo.jpg").c_str());
-    SD.remove((base + "/meta.json").c_str());
+    // Supprimer tous les fichiers du dossier
+    File dh = SD.open(base);
+    if (dh && dh.isDirectory()) {
+        File fe = dh.openNextFile();
+        while (fe) {
+            if (!fe.isDirectory()) {
+                String fp = base + "/" + fe.name();
+                fe.close(); SD.remove(fp.c_str());
+            } else fe.close();
+            fe = dh.openNextFile();
+        }
+        dh.close();
+    } else if (dh) dh.close();
     bool ok = SD.rmdir(base.c_str());
     if (g_sd_mutex) xSemaphoreGive(g_sd_mutex);
     req->send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
@@ -797,6 +813,8 @@ static void config_defaults() {
     g_cfg.gps_enabled        = false;
     g_cfg.gps_rx_pin         = 43;
     g_cfg.gps_tx_pin         = 44;
+    g_cfg.idle_photo_interval_s = 60;
+    g_cfg.rec_photo_interval_s  = 10;
 }
 
 static bool config_load() {
@@ -827,8 +845,10 @@ static bool config_load() {
     g_cfg.cam_aec_value      = doc["cam_aec_value"]      | (int)g_cfg.cam_aec_value;
     g_cfg.cam_agc_gain       = doc["cam_agc_gain"]       | (int)g_cfg.cam_agc_gain;
     g_cfg.gps_enabled        = doc["gps_enabled"]        | g_cfg.gps_enabled;
-    g_cfg.gps_rx_pin         = doc["gps_rx_pin"]         | (int)g_cfg.gps_rx_pin;
-    g_cfg.gps_tx_pin         = doc["gps_tx_pin"]         | (int)g_cfg.gps_tx_pin;
+    g_cfg.gps_rx_pin            = doc["gps_rx_pin"]            | (int)g_cfg.gps_rx_pin;
+    g_cfg.gps_tx_pin            = doc["gps_tx_pin"]            | (int)g_cfg.gps_tx_pin;
+    g_cfg.idle_photo_interval_s = doc["idle_photo_interval_s"] | (int)g_cfg.idle_photo_interval_s;
+    g_cfg.rec_photo_interval_s  = doc["rec_photo_interval_s"]  | (int)g_cfg.rec_photo_interval_s;
     return true;
 }
 
@@ -853,9 +873,11 @@ static void config_save() {
     doc["cam_framesize"]       = g_cfg.cam_framesize;
     doc["cam_aec_value"]       = g_cfg.cam_aec_value;
     doc["cam_agc_gain"]        = g_cfg.cam_agc_gain;
-    doc["gps_enabled"]         = g_cfg.gps_enabled;
-    doc["gps_rx_pin"]          = g_cfg.gps_rx_pin;
-    doc["gps_tx_pin"]          = g_cfg.gps_tx_pin;
+    doc["gps_enabled"]           = g_cfg.gps_enabled;
+    doc["gps_rx_pin"]            = g_cfg.gps_rx_pin;
+    doc["gps_tx_pin"]            = g_cfg.gps_tx_pin;
+    doc["idle_photo_interval_s"] = g_cfg.idle_photo_interval_s;
+    doc["rec_photo_interval_s"]  = g_cfg.rec_photo_interval_s;
     String out; serializeJson(doc, out);
     if (g_sd_mutex) xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
     SD.remove("/config.json");
@@ -909,9 +931,11 @@ void ap_webserver_init() {
                 g_cfg.cam_framesize      = doc["cam_framesize"]      | (int)g_cfg.cam_framesize;
                 g_cfg.cam_aec_value      = doc["cam_aec_value"]      | (int)g_cfg.cam_aec_value;
                 g_cfg.cam_agc_gain       = doc["cam_agc_gain"]       | (int)g_cfg.cam_agc_gain;
-                g_cfg.gps_enabled        = doc["gps_enabled"]        | g_cfg.gps_enabled;
-                g_cfg.gps_rx_pin         = doc["gps_rx_pin"]         | (int)g_cfg.gps_rx_pin;
-                g_cfg.gps_tx_pin         = doc["gps_tx_pin"]         | (int)g_cfg.gps_tx_pin;
+                g_cfg.gps_enabled           = doc["gps_enabled"]           | g_cfg.gps_enabled;
+                g_cfg.gps_rx_pin            = doc["gps_rx_pin"]            | (int)g_cfg.gps_rx_pin;
+                g_cfg.gps_tx_pin            = doc["gps_tx_pin"]            | (int)g_cfg.gps_tx_pin;
+                g_cfg.idle_photo_interval_s = doc["idle_photo_interval_s"] | (int)g_cfg.idle_photo_interval_s;
+                g_cfg.rec_photo_interval_s  = doc["rec_photo_interval_s"]  | (int)g_cfg.rec_photo_interval_s;
                 // VAD params prennent effet immediatement (record_vad lit g_cfg)
                 config_save();
                 req->send(200, "application/json", "{\"ok\":true}");
@@ -1073,17 +1097,27 @@ static bool camera_init() {
     return true;
 }
 
-static void take_photo(const char *path) {
-    if (!g_cam_ok) return;
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) { log_line("[CAM] echec capture"); return; }
-    if (g_sd_mutex) xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
-    File f = SD.open(path, FILE_WRITE);
-    if (f) { f.write(fb->buf, fb->len); f.close();
-              log_linef("[CAM] %s %.1fkB", path, fb->len/1024.0f); }
-    else log_linef("[CAM] ERREUR ouverture %s", path);
-    if (g_sd_mutex) xSemaphoreGive(g_sd_mutex);
-    esp_camera_fb_return(fb);
+static bool take_photo_retry(const char *path, int max_tries = 3) {
+    if (!g_cam_ok || !g_sd_ok) return false;
+    for (int t = 0; t < max_tries; t++) {
+        if (t > 0) {
+            log_linef("[CAM] retry %d/%d pour %s", t+1, max_tries, path);
+            delay(2000);
+        }
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) { log_line("[CAM] echec framebuffer"); continue; }
+        bool ok = false;
+        if (g_sd_mutex) xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+        File f = SD.open(path, FILE_WRITE);
+        if (f) { f.write(fb->buf, fb->len); f.close(); ok = true;
+                 log_linef("[CAM] %s %.1fkB", path, fb->len/1024.0f); }
+        else log_linef("[CAM] ERREUR open %s", path);
+        if (g_sd_mutex) xSemaphoreGive(g_sd_mutex);
+        esp_camera_fb_return(fb);
+        if (ok) return true;
+    }
+    log_linef("[CAM] ECHEC %d essais: %s", max_tries, path);
+    return false;
 }
 
 // ============================================================
@@ -1197,12 +1231,14 @@ void record_vad() {
     int pr_head = 0, pr_count = 0;
     File wav;
     uint32_t written = 0, silence_ms = 0, rec_start = 0, last_print = 0, last_veil = 0;
-    uint16_t rms_peak = 0;
+    uint32_t last_idle_photo = 0, last_rec_photo = 0;
+    uint16_t rms_peak = 0, photo_num = 0;
     int votes = 0;
     bool recording = false;
     char session_id[24] = "", photo_path[64] = "";
 
     seed_noise_ema(buf, fbuf);
+    last_idle_photo = millis();  // 1ere photo veille apres 1 intervalle complet
     log_linef("[VAD] trigger=%u silence=%u NTP=%s", g_vad_trigger, g_vad_silence, g_ntp_synced?"OK":"NON");
     log_linef("[VAD] http://%s/", WiFi.softAPIP().toString().c_str());
     log_line("[VAD] En attente de voix...");
@@ -1254,6 +1290,15 @@ void record_vad() {
                 rms_peak = 0; last_veil = now;
             }
 
+            // Photo cyclique en mode veille
+            if (g_cam_ok && g_sd_ok && g_cfg.idle_photo_interval_s > 0 &&
+                (now - last_idle_photo >= (uint32_t)g_cfg.idle_photo_interval_s * 1000)) {
+                char idle_path[64]; char ts[24]; get_timestamp(ts, sizeof(ts));
+                snprintf(idle_path, sizeof(idle_path), "/idle_%s.jpg", ts);
+                take_photo_retry(idle_path, 2);
+                last_idle_photo = now;
+            }
+
             if (voice) {
                 get_timestamp(session_id, sizeof(session_id));
                 char dir[48], wav_path[64];
@@ -1276,15 +1321,28 @@ void record_vad() {
                     pr_count = 0; pr_head = 0;
                 }
                 silence_ms = 0; votes = 0; rms_peak = 0; rec_start = now; last_print = now;
-                recording = true;
+                recording = true; photo_num = 0; last_rec_photo = now;
                 strncpy(g_session_d, session_id, sizeof(g_session_d) - 1);
                 g_wav_written_d = 0; g_sil_ms_d = 0; g_recording = true;
                 log_linef("[%s] DEBUT rms=%u trig=%u", session_id, rms_filt, g_vad_trigger);
+                // Photo immediate au debut
+                char ph_start[64];
+                snprintf(ph_start, sizeof(ph_start), "/session_%s/photo_%03u.jpg", session_id, ++photo_num);
+                take_photo_retry(ph_start, 2);
             }
         } else {
             wav.write(buf, br); written += br;
             if (voice) silence_ms = 0; else silence_ms += VAD_CHUNK_MS;
             g_wav_written_d = written; g_sil_ms_d = silence_ms;
+
+            // Photo periodique pendant l'enregistrement
+            if (g_cam_ok && g_sd_ok && g_cfg.rec_photo_interval_s > 0 &&
+                (now - last_rec_photo >= (uint32_t)g_cfg.rec_photo_interval_s * 1000)) {
+                char ph_path[64];
+                snprintf(ph_path, sizeof(ph_path), "/session_%s/photo_%03u.jpg", session_id, ++photo_num);
+                take_photo_retry(ph_path, 1);
+                last_rec_photo = now;
+            }
 
             if (now - last_print >= 1000) {
                 uint32_t sec = (now - rec_start) / 1000;
@@ -1300,9 +1358,10 @@ void record_vad() {
                 log_linef("[%s] FIN %.1fs %lub %s",
                     session_id, written / (float)(SAMPLE_RATE * 2),
                     written, tout ? "TIMEOUT" : "SILENCE");
-                take_photo(photo_path);
+                take_photo_retry(photo_path, 3);  // photo.jpg = fin de session, 3 essais
                 if (g_cfg.gps_enabled) write_session_meta(session_id);
                 g_recording = false; recording = false;
+                last_idle_photo = millis();  // ne pas declencher photo veille immediatement apres
                 log_line("[VAD] En attente de voix...");
             }
         }
