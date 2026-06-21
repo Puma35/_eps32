@@ -119,15 +119,25 @@ static float    g_noise_ema   = 1000.0f;
 static uint16_t g_vad_trigger = 40;
 static uint16_t g_vad_silence = 15;
 static bool     g_cam_ok      = false;
+static bool     g_sd_ok       = false;
 
-// ============================================================
-//  SSE TERMINAL
-// ============================================================
+// ---- Log ring buffer (ecrit Core1, lu Core0 via /log) ----
+#define LOG_RING  80
+#define LOG_MAX  128
+static char              g_log_ring[LOG_RING][LOG_MAX];
+static volatile int      g_log_total = 0;
+static SemaphoreHandle_t g_log_mutex = nullptr;
+
+// AsyncEventSource conserve pour l'avenir (non utilise pour les logs)
 static AsyncEventSource g_events("/events");
 
 static void log_line(const char *msg) {
     Serial.println(msg);
-    g_events.send(msg, "log", millis());
+    if (g_log_mutex && xSemaphoreTake(g_log_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        strlcpy(g_log_ring[g_log_total % LOG_RING], msg, LOG_MAX);
+        g_log_total++;
+        xSemaphoreGive(g_log_mutex);
+    }
 }
 static void log_linef(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void log_linef(const char *fmt, ...) {
@@ -378,6 +388,11 @@ async function refreshStats(){
 async function refreshSD(){
   try{
     const d=await(await fetch('/sdinfo')).json();
+    if(d.error){
+      document.getElementById('hsd').textContent='SD ERR';
+      document.getElementById('dsd').innerHTML='<div style="color:#f44;font-size:11px;padding:4px">Carte SD non initialisee -- verifier la carte</div>';
+      return;
+    }
     const pct=Math.round(d.used*100/d.total);
     document.getElementById('hsd').textContent=fmtB(d.free)+' libre';
     document.getElementById('dsd').innerHTML=
@@ -567,33 +582,39 @@ function drawMap(id,pts,h){
   });
 }
 
-// ===== TERMINAL =====
-let tLines=0,tPaused=false,tAuto=true;
+// ===== TERMINAL (polling /log) =====
+let tLines=0,tPaused=false,tAuto=true,logIdx=0;
 document.getElementById('tpause').onchange=e=>tPaused=e.target.checked;
 document.getElementById('tscroll').onchange=e=>tAuto=e.target.checked;
-function termClr(){document.getElementById('term').innerHTML='';tLines=0;updT();}
+function termClr(){document.getElementById('term').innerHTML='';tLines=0;logIdx=0;updT();}
 function updT(){document.getElementById('tcnt').textContent=tLines+' lignes';}
-const evs=new EventSource('/events');
-evs.addEventListener('log',e=>{
-  if(tPaused) return;
+function appendLog(msg){
   const t=document.getElementById('term');
   const d=document.createElement('div');
   const ts=new Date().toLocaleTimeString('fr',{hour12:false});
-  d.textContent=`[${ts}] ${e.data}`;
-  if(/ERREUR|ERROR/.test(e.data)) d.style.color='#f44';
-  else if(/DEBUT|REC\b/.test(e.data)) d.style.color='#f80';
-  else if(/FIN\b|OK\b/.test(e.data)) d.style.color='#8f8';
+  d.textContent='['+ts+'] '+msg;
+  if(/ERREUR|ERROR/.test(msg)) d.style.color='#f44';
+  else if(/DEBUT|REC\b/.test(msg)) d.style.color='#f80';
+  else if(/FIN\b|OK\b/.test(msg)) d.style.color='#8f8';
   t.appendChild(d);
   while(t.children.length>200){t.removeChild(t.firstChild);tLines--;}
   tLines++; updT();
   if(tAuto) t.scrollTop=t.scrollHeight;
-});
+}
+async function pollLog(){
+  if(tPaused) return;
+  try{
+    const d=await(await fetch('/log?from='+logIdx)).json();
+    if(d.lines&&d.lines.length){d.lines.forEach(appendLog);logIdx=d.total;}
+  }catch(e){}
+}
 
 // ===== INIT =====
-refreshStats(); refreshSD(); loadSess();
+refreshStats(); refreshSD(); loadSess(); pollLog();
 setInterval(refreshStats,1000);
 setInterval(refreshSD,15000);
 setInterval(loadSess,8000);
+setInterval(pollLog,1000);
 </script>
 </body>
 </html>)WEBUI";
@@ -661,10 +682,38 @@ static void handle_file(AsyncWebServerRequest *req) {
 }
 
 static void handle_sdinfo(AsyncWebServerRequest *req) {
+    if (!g_sd_ok) {
+        req->send(200, "application/json", "{\"total\":0,\"used\":0,\"free\":0,\"error\":true}");
+        return;
+    }
     char buf[128];
     uint64_t tot = SD.totalBytes(), used = SD.usedBytes();
-    snprintf(buf, sizeof(buf), "{\"total\":%llu,\"used\":%llu,\"free\":%llu}", tot, used, tot - used);
+    snprintf(buf, sizeof(buf), "{\"total\":%llu,\"used\":%llu,\"free\":%llu,\"error\":false}", tot, used, tot - used);
     req->send(200, "application/json", buf);
+}
+
+static void handle_log(AsyncWebServerRequest *req) {
+    int from = 0;
+    if (req->hasParam("from")) from = req->getParam("from")->value().toInt();
+    int total = g_log_total;
+    int start = (total - LOG_RING > from) ? (total - LOG_RING) : from;
+    if (start < 0) start = 0;
+    String json = "{\"total\":" + String(total) + ",\"lines\":[";
+    bool first = true;
+    for (int i = start; i < total; i++) {
+        const char *s = g_log_ring[i % LOG_RING];
+        if (!first) json += ',';
+        json += '"';
+        for (; *s; s++) {
+            if (*s == '"') { json += "\\\""; }
+            else if (*s == '\\') { json += "\\\\"; }
+            else json += *s;
+        }
+        json += '"';
+        first = false;
+    }
+    json += "]}";
+    req->send(200, "application/json", json);
 }
 
 static void handle_gps(AsyncWebServerRequest *req) {
@@ -831,6 +880,7 @@ void ap_webserver_init() {
     g_ws.on("/sessions",HTTP_GET,    handle_sessions);
     g_ws.on("/file",    HTTP_GET,    handle_file);
     g_ws.on("/sdinfo",  HTTP_GET,    handle_sdinfo);
+    g_ws.on("/log",     HTTP_GET,    handle_log);
     g_ws.on("/gps",     HTTP_GET,    handle_gps);
     g_ws.on("/config",  HTTP_GET,    handle_config_get);
     g_ws.on("/session", HTTP_DELETE, handle_session_delete);
@@ -1272,7 +1322,8 @@ void setup() {
         getCpuFrequencyMhz(), ESP.getPsramSize()/1024,
         spi_flash_get_chip_size()/(1024*1024));
 
-    g_sd_mutex = xSemaphoreCreateMutex();
+    g_sd_mutex  = xSemaphoreCreateMutex();
+    g_log_mutex = xSemaphoreCreateMutex();
     config_defaults();  // toujours avant NTP pour avoir les creds WiFi
 
     Serial.println("\n[1/6] NTP...");
@@ -1289,6 +1340,7 @@ void setup() {
         log_line("ERREUR SD -- sessions desactivees (verif carte)");
         // pas de blocage : l'AP reste accessible
     } else {
+        g_sd_ok = true;
         log_linef("SD OK %lluMB type=%d", SD.cardSize()/(1024*1024), SD.cardType());
         if (config_load()) log_line("Config: /config.json charge");
         else log_line("Config: valeurs par defaut");
