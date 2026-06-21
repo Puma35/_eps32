@@ -1273,23 +1273,26 @@ void setup() {
         spi_flash_get_chip_size()/(1024*1024));
 
     g_sd_mutex = xSemaphoreCreateMutex();
+    config_defaults();  // toujours avant NTP pour avoir les creds WiFi
 
-    Serial.println("\n[1/6] SD + Config...");
+    Serial.println("\n[1/6] NTP...");
+    wifi_ntp_init();
+
+    Serial.println("[2/6] AP + WebServer...");
+    ap_webserver_init();
+    // L'AP est UP ici : la carte est joignable meme si SD ou camera plante
+
+    Serial.println("[3/6] SD + Config...");
     pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH); delay(100);
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN); delay(100);
     if (!SD.begin(SD_CS_PIN)) {
-        Serial.println("ERREUR SD -- blocage"); while (1) delay(1000);
+        log_line("ERREUR SD -- sessions desactivees (verif carte)");
+        // pas de blocage : l'AP reste accessible
+    } else {
+        log_linef("SD OK %lluMB type=%d", SD.cardSize()/(1024*1024), SD.cardType());
+        if (config_load()) log_line("Config: /config.json charge");
+        else log_line("Config: valeurs par defaut");
     }
-    Serial.printf("  SD OK %lluMB type=%d\n", SD.cardSize()/(1024*1024), SD.cardType());
-    config_defaults();
-    if (config_load()) Serial.println("  Config: /config.json charge");
-    else Serial.println("  Config: valeurs par defaut");
-
-    Serial.println("[2/6] NTP...");
-    wifi_ntp_init();
-
-    Serial.println("[3/6] AP + WebServer...");
-    ap_webserver_init();
 
     Serial.println("[4/6] Camera...");
     g_cam_ok = camera_init();
