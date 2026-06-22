@@ -189,6 +189,8 @@ nav{display:flex;background:#0d0d0d;border-bottom:1px solid #1a1a1a;flex-shrink:
 .bar{background:#0f0;height:100%;border-radius:2px;transition:.3s;max-width:100%}
 .bar.w{background:#f80}.bar.c{background:#f44}
 .scard{background:#0d0d0d;border:1px solid #1d1d1d;border-radius:3px;overflow:hidden;margin-bottom:5px}
+.scard.idle{border-left:2px solid #024}
+.st.idle{color:#48f}
 .sh{padding:7px 9px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
 .sh:hover{background:#131313}
 .st{color:#ff0;font-size:11px}.sa{color:#333;font-size:11px}
@@ -256,7 +258,7 @@ audio{width:100%;height:28px;margin-bottom:4px}
 
 <div id="pan-sess" class="pan">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-    <div class="sec" style="margin:0">Sessions &mdash; <span id="scnt">0</span></div>
+    <div class="sec" style="margin:0">Timeline &mdash; <span id="scnt">0</span></div>
     <button class="btn" onclick="loadSess()">&#8635;</button>
   </div>
   <canvas id="sesscvs" style="display:none;width:100%;height:180px;border:1px solid #1a1a1a;border-radius:2px;background:#0a0a0a;margin-bottom:6px"></canvas>
@@ -413,31 +415,49 @@ let knownS=[],openC=new Set();
 async function loadSess(){
   try{
     const list=await(await fetch('/sessions')).json();
-    list.sort().reverse();
-    document.getElementById('scnt').textContent=list.length;
+    list.sort((a,b)=>b.id.localeCompare(a.id));
+    const ns=list.filter(x=>x.t==='s').length,ni=list.filter(x=>x.t==='i').length;
+    document.getElementById('scnt').textContent=ns+' sessions, '+ni+' photos veille';
     if(JSON.stringify(list)!==JSON.stringify(knownS)){knownS=list;renderSess(list);}
   }catch(e){}
 }
 function renderSess(list){
   const g=document.getElementById('sgrid');
-  if(!list.length){g.innerHTML='<div class="nosess">Aucune session enregistree</div>';return;}
+  if(!list.length){g.innerHTML='<div class="nosess">Aucune entree dans la timeline</div>';return;}
   g.innerHTML='';
-  list.forEach(sess=>{
-    const open=openC.has(sess);
+  list.forEach(item=>{
+    const isIdle=(item.t==='i');
+    const id=item.id;
+    const key=(isIdle?'i_':'s_')+id;
+    const open=openC.has(key);
     const el=document.createElement('div');
-    el.className='scard';
-    el.innerHTML=
-      `<div class="sh" onclick="togS('${sess}',this)"><span class="st">${fmtId(sess)}</span><span class="sa">${open?'&#9650;':'&#9660;'}</span></div>`+
-      `<div class="sb${open?' on':''}" id="sc_${sess}">`+
-        `<img class="si" src="/file?p=/session_${sess}/photo.jpg" onerror="this.style.display='none'" onclick="window.open(this.src)">`+
-        `<audio controls preload="none"><source src="/file?p=/session_${sess}/audio.wav" type="audio/wav"></audio>`+
-        `<div class="gline" id="gm_${sess}">GPS: ---</div>`+
-        `<button class="bdel" onclick="delS('${sess}')">&#128465; Supprimer</button>`+
-      `</div>`;
+    el.className='scard'+(isIdle?' idle':'');
+    const lbl=isIdle?('&#128247; '+fmtId(id)):fmtId(id);
+    let inner=`<div class="sh" onclick="togS('${key}',this)"><span class="st${isIdle?' idle':''}">${lbl}</span><span class="sa">${open?'&#9650;':'&#9660;'}</span></div>`+
+      `<div class="sb${open?' on':''}" id="sc_${key}">`;
+    if(isIdle){
+      inner+=`<img class="si" src="/file?p=/idle_${id}.jpg" onerror="this.style.display='none'" onclick="window.open(this.src)">`+
+        `<button class="bdel" onclick="delIdle('${id}')">&#128465; Supprimer</button>`;
+    } else {
+      inner+=`<img class="si" src="/file?p=/session_${id}/photo.jpg" onerror="this.style.display='none'" onclick="window.open(this.src)">`+
+        `<audio controls preload="none"><source src="/file?p=/session_${id}/audio.wav" type="audio/wav"></audio>`+
+        `<div class="gline" id="gm_${id}">GPS: ---</div>`+
+        `<button class="bdel" onclick="delS('${id}')">&#128465; Supprimer</button>`;
+    }
+    inner+='</div>';
+    el.innerHTML=inner;
     g.appendChild(el);
-    if(open) loadMeta(sess);
+    if(open&&!isIdle) loadMeta(id);
   });
   loadSessMap();
+}
+async function delIdle(id){
+  if(!confirm('Supprimer la photo '+fmtId(id)+' ?')) return;
+  try{
+    const r=await fetch('/idle?id='+id,{method:'DELETE'});
+    if(r.ok){knownS=[];loadSess();toast('Photo supprimee');}
+    else toast('Erreur suppression',false);
+  }catch(e){toast('Erreur: '+e.message,false);}
 }
 function togS(s,hdr){
   const b=document.getElementById('sc_'+s);
@@ -655,14 +675,17 @@ static void handle_sessions(AsyncWebServerRequest *req) {
     if (root) {
         File entry = root.openNextFile();
         while (entry) {
-            if (entry.isDirectory()) {
-                String name = entry.name();
-                if (name.startsWith("/")) name = name.substring(1);
-                if (name.startsWith("session_")) {
-                    if (!first) json += ",";
-                    json += "\"" + name.substring(8) + "\"";  // strip "session_" prefix
-                    first = false;
-                }
+            String name = entry.name();
+            if (name.startsWith("/")) name = name.substring(1);
+            if (entry.isDirectory() && name.startsWith("session_")) {
+                if (!first) json += ",";
+                json += "{\"t\":\"s\",\"id\":\"" + name.substring(8) + "\"}";
+                first = false;
+            } else if (!entry.isDirectory() && name.startsWith("idle_") && name.endsWith(".jpg")) {
+                String id = name.substring(5, name.length() - 4);  // strip "idle_" and ".jpg"
+                if (!first) json += ",";
+                json += "{\"t\":\"i\",\"id\":\"" + id + "\"}";
+                first = false;
             }
             entry.close(); entry = root.openNextFile();
         }
@@ -671,6 +694,17 @@ static void handle_sessions(AsyncWebServerRequest *req) {
     xSemaphoreGive(g_sd_mutex);
     json += "]";
     req->send(200, "application/json", json);
+}
+
+static void handle_idle_delete(AsyncWebServerRequest *req) {
+    if (!req->hasParam("id")) { req->send(400, "text/plain", "missing id"); return; }
+    String id = req->getParam("id")->value();
+    if (id.indexOf("..") >= 0 || id.indexOf("/") >= 0) { req->send(403, "text/plain", "invalid"); return; }
+    String path = "/idle_" + id + ".jpg";
+    if (g_sd_mutex) xSemaphoreTake(g_sd_mutex, portMAX_DELAY);
+    bool ok = SD.remove(path.c_str());
+    if (g_sd_mutex) xSemaphoreGive(g_sd_mutex);
+    req->send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
 static void handle_file(AsyncWebServerRequest *req) {
@@ -906,6 +940,7 @@ void ap_webserver_init() {
     g_ws.on("/gps",     HTTP_GET,    handle_gps);
     g_ws.on("/config",  HTTP_GET,    handle_config_get);
     g_ws.on("/session", HTTP_DELETE, handle_session_delete);
+    g_ws.on("/idle",    HTTP_DELETE, handle_idle_delete);
 
     // POST /config — accumulate body, then parse
     g_ws.on("/config", HTTP_POST,
