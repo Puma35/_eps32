@@ -1393,13 +1393,15 @@ void setup() {
     // L'AP est UP ici : la carte est joignable meme si SD ou camera plante
 
     Serial.println("[3/6] SD + Config...");
-    pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH); delay(100);
-    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN); delay(100);
-    if (!SD.begin(SD_CS_PIN)) {
+    pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH); delay(200);
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN); delay(200);
+    for (int _sd_try = 0; _sd_try < 3 && !g_sd_ok; _sd_try++) {
+        if (_sd_try > 0) { SD.end(); delay(1000); }
+        if (SD.begin(SD_CS_PIN, SPI, 4000000)) g_sd_ok = true;
+    }
+    if (!g_sd_ok) {
         log_line("ERREUR SD -- sessions desactivees (verif carte)");
-        // pas de blocage : l'AP reste accessible
     } else {
-        g_sd_ok = true;
         log_linef("SD OK %lluMB type=%d", SD.cardSize()/(1024*1024), SD.cardType());
         if (config_load()) log_line("Config: /config.json charge");
         else log_line("Config: valeurs par defaut");
