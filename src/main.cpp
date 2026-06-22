@@ -113,6 +113,11 @@ static volatile bool   g_gps_fix = false;
 // ---- SD mutex (VAD writes vs WebServer reads) ----
 static SemaphoreHandle_t g_sd_mutex = nullptr;
 
+// ---- Photo async queue (Core1 poste, Core0 execute) ----
+#define PHOTO_Q_LEN   4
+#define PHOTO_Q_PLEN 64
+static QueueHandle_t g_photo_q = nullptr;
+
 // ---- NTP ----
 static bool g_ntp_synced = false;
 
@@ -1155,6 +1160,22 @@ static bool take_photo_retry(const char *path, int max_tries = 3) {
     return false;
 }
 
+// Tache Core0 : prend les photos de la queue sans bloquer Core1
+static void photo_task_fn(void *) {
+    char path[PHOTO_Q_PLEN];
+    while (true) {
+        if (xQueueReceive(g_photo_q, path, portMAX_DELAY) == pdTRUE)
+            take_photo_retry(path, 2);
+    }
+}
+// Poste un chemin photo dans la queue (non-bloquant, drop si pleine)
+static void enqueue_photo(const char *path) {
+    if (!g_photo_q || !g_cam_ok || !g_sd_ok) return;
+    char buf[PHOTO_Q_PLEN];
+    strlcpy(buf, path, sizeof(buf));
+    xQueueSend(g_photo_q, buf, 0);
+}
+
 // ============================================================
 //  MICRO PDM
 // ============================================================
@@ -1330,7 +1351,7 @@ void record_vad() {
                 (now - last_idle_photo >= (uint32_t)g_cfg.idle_photo_interval_s * 1000)) {
                 char idle_path[64]; char ts[24]; get_timestamp(ts, sizeof(ts));
                 snprintf(idle_path, sizeof(idle_path), "/idle_%s.jpg", ts);
-                take_photo_retry(idle_path, 2);
+                enqueue_photo(idle_path);
                 last_idle_photo = now;
             }
 
@@ -1363,7 +1384,7 @@ void record_vad() {
                 // Photo immediate au debut
                 char ph_start[64];
                 snprintf(ph_start, sizeof(ph_start), "/session_%s/photo_%03u.jpg", session_id, ++photo_num);
-                take_photo_retry(ph_start, 2);
+                enqueue_photo(ph_start);
             }
         } else {
             wav.write(buf, br); written += br;
@@ -1375,7 +1396,7 @@ void record_vad() {
                 (now - last_rec_photo >= (uint32_t)g_cfg.rec_photo_interval_s * 1000)) {
                 char ph_path[64];
                 snprintf(ph_path, sizeof(ph_path), "/session_%s/photo_%03u.jpg", session_id, ++photo_num);
-                take_photo_retry(ph_path, 1);
+                enqueue_photo(ph_path);
                 last_rec_photo = now;
             }
 
@@ -1393,7 +1414,7 @@ void record_vad() {
                 log_linef("[%s] FIN %.1fs %lub %s",
                     session_id, written / (float)(SAMPLE_RATE * 2),
                     written, tout ? "TIMEOUT" : "SILENCE");
-                take_photo_retry(photo_path, 3);  // photo.jpg = fin de session, 3 essais
+                enqueue_photo(photo_path);  // photo.jpg = fin de session
                 if (g_cfg.gps_enabled) write_session_meta(session_id);
                 g_recording = false; recording = false;
                 last_idle_photo = millis();  // ne pas declencher photo veille immediatement apres
@@ -1445,6 +1466,11 @@ void setup() {
     Serial.println("[4/6] Camera...");
     g_cam_ok = camera_init();
     if (!g_cam_ok) Serial.println("  AVERTISSEMENT: camera KO");
+    if (g_cam_ok && g_sd_ok) {
+        g_photo_q = xQueueCreate(PHOTO_Q_LEN, PHOTO_Q_PLEN);
+        xTaskCreatePinnedToCore(photo_task_fn, "photo", 4096, NULL, 2, NULL, 0);
+        Serial.println("  Tache photo async OK (Core0)");
+    }
 
     Serial.println("[5/6] Micro PDM...");
     if (!mic_init()) { Serial.println("ERREUR micro -- blocage"); while (1) delay(1000); }
